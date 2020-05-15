@@ -583,6 +583,7 @@ void predictive_maintenance(tensor* lstm_1_input, tensor* dense_1_output) {
 		readfloatfromfile(&ff_dense_1_kernel_array[0], "dense_1_kernel.txt", 50);
 		quantize_arr(&ff_dense_1_kernel_array[0], &dense_1_kernel_array[0], 50);
 		
+		readfloatfromfile(&ff_dense_1_bias_array[0], "dense_1_bias.txt", 1);
 		quantize_arr(&ff_dense_1_bias_array[0], &dense_1_bias_array[0], 1);
 #else
 		printf("Reading Weights...\n");
@@ -593,6 +594,7 @@ void predictive_maintenance(tensor* lstm_1_input, tensor* dense_1_output) {
 		readfloatfromfile(&lstm_2_recurrent_kernel_array[0], "lstm_2_recurrent_kernel.txt", 10000);
 		readfloatfromfile(&lstm_2_bias_array[0], "lstm_2_bias.txt", 200);
 		readfloatfromfile(&dense_1_kernel_array[0], "dense_1_kernel.txt", 50);
+		readfloatfromfile(&dense_1_bias_array[0], "dense_1_bias.txt", 1);
 #endif
 		data_loaded = true;
 	}
