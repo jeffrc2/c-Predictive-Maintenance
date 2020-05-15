@@ -25,7 +25,7 @@
 #define SIGNED 1 //Signed integer or not
 
 #define CONVERT_INPUT 1 //If you want to convert the input from float to value
-#define SAVE_DATA 0 //If you want to save the data
+#define SAVE_DATA 1 //If you want to save the data
 #define F_RANGE 7.125f
 
 float float_range;
@@ -100,7 +100,7 @@ typedef struct tensor
     size_t shape[MAX_NDIM];
 } tensor;
 
- void writetofile(value* value_array, char* filename, size_t length){
+void writetofile(value* value_array, char* filename, size_t length){
 	printf("Writing values to file  %s\n", filename);
 	FILE *filePtr;
 	filePtr = fopen(filename, "w");
@@ -710,7 +710,9 @@ int main() {
 	printf("Quantizing Float Input...\n");
 	#if QUANTIZE
 		writetofile(&test_input_array[0], "q_seq_array_test_last.txt", MTEST*MHEIGHT*MWIDTH);
-		writetofile(&test_truth_array[0], "q_label_array_test_last.txt", MTEST);
+		value q_truth_array[MTEST];
+		for(int i = 0; i < MTEST; ++i) q_truth_array[i] = (value)test_truth_array[i];
+		writetofile(&q_truth_array[0], "q_label_array_test_last.txt", MTEST);
 	#else
 		writetofile(&test_input_array[0], "ff_seq_array_test_last.txt", MTEST*MHEIGHT*MWIDTH);
 		writetofile(&test_truth_array[0], "ff_label_array_test_last.txt", MTEST);
