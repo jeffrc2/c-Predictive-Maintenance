@@ -16,17 +16,21 @@
 #define LSTM_1_UNITS 50
 #define LSTM_2_UNITS 100
 
-#define LSTM_WEIGHT_FACTOR 4
-
-#define QUANT_BITS 8 //Set to 8,16,32
+#define QUANT_BITS 4 //Set to 8,16,32
 
 #define QUANTIZE 1 //Running quantization
 
 #define SIGNED 1 //Signed integer or not
 
-#define CONVERT_INPUT 1 //If you want to convert the input from float to value
-#define SAVE_DATA 1 //If you want to save the data
-#define F_RANGE 7.125f
+#define CONVERT_INPUT 1 //If you want to convert the input from float to value. Do not enable if you have not enabled QUANTIZE
+#define SAVE_DATA 0 //If you want to save the data
+#define F_RANGE 2.5f
+
+#define S_MINMAX F_RANGE
+
+#define SUBBYTE (QUANT_BITS <= 4)
+
+#define SATURATE 0
 
 float float_range;
 float float_max;
@@ -41,7 +45,7 @@ bool weights_saved = false;
 			typedef int64_t multiplier;
 		#else
 			typedef uint32_t value;
-			typedef uint64_t multiplier;
+			typedef int64_t multiplier;
 		#endif
 	#elif QUANT_BITS == 16
 		#if SIGNED
@@ -59,14 +63,16 @@ bool weights_saved = false;
 			typedef uint8_t value;
 			typedef uint16_t multiplier;
 		#endif
-	// #elif QUANT_BITS == 4
-		// #if SIGNED
-			// typedef int4_t value;
-			// typedef int8_t multiplier;
-		// #else
-			// typedef uint4_t value;
-			// typedef uint8_t multiplier;
-		// #endif
+	#elif SUBBYTE
+		#if SIGNED
+			typedef struct bitcell {
+				int8_t val : QUANT_BITS;
+			} value;
+			typedef int8_t multiplier;
+		#else 
+			typedef float value;
+			typedef float multiplier;
+		#endif
 	#else
 		typedef float value;
 		typedef float multiplier;
@@ -150,7 +156,7 @@ void readvaluefromfile(value* value_array, char* filename, size_t length)
 		printf("File not found: %s", filename);
 		exit(1);
 	}
-	
+	size_t count = 0;
 	for (size_t i = 0; i < length; i++) {
 		bool status;
 #if QUANTIZE
@@ -183,7 +189,11 @@ void readvaluefromfile(value* value_array, char* filename, size_t length)
 		if (status) {
 			printf("Access error in %s array index %zu : input not valid.", filename, i);
 			exit(1);
-		} 
+		} else count++;
+	}
+	if (count < length) {
+		printf("Not enough input in %s ", filename);
+		exit(1);
 	}
 	fclose(fp);
 }
@@ -209,7 +219,7 @@ void readfloatfromfile(float* float_array, char* filename, size_t length)
 	}
 	fclose(fp);
 }
-
+int test = 0;	
 #if QUANTIZE
 float get_qrange()
 {	
@@ -217,7 +227,7 @@ float get_qrange()
 	if (QUANT_BITS == 32) qrange = UINT32_MAX;
 	else if (QUANT_BITS == 16) qrange = UINT16_MAX;
 	else if (QUANT_BITS == 8) qrange = UINT8_MAX;
-	else if (QUANT_BITS == 4) qrange = 15;
+	else if (SUBBYTE) qrange = (float)pow(2, QUANT_BITS) - 1 ;
 	else 
 	{
 		printf("Invalid Fixed Bit Size");
@@ -230,19 +240,24 @@ float get_qrange()
 
 value get_invscale()
 {
-	float q_range = (float) get_qrange();
+	double q_range = (double) get_qrange();
+	printf("Quantized Inverse Scale: %f\n", q_range/float_range); 
+#if SUBBYTE
+	value qinvscale = {(multiplier) (q_range/float_range)};
+#else
 	value qinvscale = (value) (q_range/float_range);
+#endif
 	printf("Quantized Inverse Scale: %d\n", qinvscale);
 	return qinvscale;
 }
 
 value get_zeropoint(value qinvscale)
 {
-	float qmax = (float) float_max;
+	double qmax = (double) float_max;
 	if (QUANT_BITS == 32) qmax = (SIGNED) ? INT32_MAX : UINT32_MAX;
 	else if (QUANT_BITS == 16) qmax = (SIGNED) ? INT16_MAX : UINT16_MAX;
 	else if (QUANT_BITS == 8) qmax = (SIGNED) ? INT8_MAX : UINT8_MAX;
-	else if (QUANT_BITS == 4) qmax = (SIGNED) ? 7 : 15;
+	else if (SUBBYTE) qmax = (SIGNED) ? (float)pow(2, QUANT_BITS)/2 - 1 : (float)pow(2, QUANT_BITS) -1;
 	else 
 	{
 		printf("Invalid Fixed Bit Size");
@@ -250,29 +265,49 @@ value get_zeropoint(value qinvscale)
 	}
 	printf("Float max: %f\n", float_max);
 	printf("Quantized max: %f\n", qmax);
-	float subtrahend = (float)(float_max*qinvscale);
+#if SUBBYTE
+	double subtrahend = (double)((double)float_max*qinvscale.val);
+#else
+	double subtrahend = (double)((double)float_max*qinvscale);
+#endif	
+	
 	printf("Quantized Zeropoint Subtrahend: %f\n", subtrahend);
-	float qzeropoint =  qmax - subtrahend;
+	double qzeropoint =  qmax - subtrahend;
 	printf("Quantized Zeropoint: %f\n", qzeropoint);
+#if SUBBYTE
+	value vzeropoint = {(multiplier) qzeropoint};
+#else
 	value vzeropoint = (value) qzeropoint;
-	printf("Value Zeropoint: %"PRIo32"\n", vzeropoint);
+#endif
+	
+	printf("Value Zeropoint: %"PRIu32"\n", vzeropoint);
 	return vzeropoint;
 }
-int test = 0;
+
 value quantize(float val)
 {
 	//if (test < 5) printf("qq sigmoidf %f \n", val);
-	float scaled = invscale * val;
-	//if (test < 5) printf("qqq sigmoidf %f \n", scaled);
+#if SUBBYTE
+	double scaled = (double) ((double)invscale.val * (double)val);
+	value quantized = {(multiplier) (scaled + zeropoint.val)};
+#else
+	double scaled = (double) ((double)invscale * (double)val);
 	value quantized = (value) (scaled + zeropoint);
+#endif
 	
+	//if (test < 5) printf("qqq sigmoidf %f \n", scaled);
 	return quantized;
 }
 
 float dequantize(value val)
 {
-	float adjusted = (float)(val - zeropoint);
+#if SUBBYTE
+	float adjusted = (float)val.val - (float)zeropoint.val;
+	float dequantized = (float) adjusted / invscale.val;
+#else
+	float adjusted = (float)((float)val - (float)zeropoint);
 	float dequantized = (float) adjusted / invscale;
+#endif
 	return dequantized;
 }
 
@@ -289,51 +324,219 @@ void quantize_arr(float* ff_array, value* val_array, size_t len)
 	}
 }
 
+value multmax;
+value multmin;
+
+
+bool isSignedAddOverflow(value val)
+{
+	
+#if SUBBYTE
+	if (val.val > quantize(S_MINMAX).val )
+#else
+	if (val > quantize(S_MINMAX) )
+#endif
+	{
+		printf("a"); 
+		return true;
+	}
+	return false;
+}
+
+bool isSignedAddUnderflow(value val)
+{
+#if SUBBYTE
+	if (val.val < quantize(-S_MINMAX).val )
+#else
+	if (val < quantize(-S_MINMAX) )
+#endif
+	
+	{
+		printf("e"); 
+		return true;
+	}
+	
+	return false;
+}
+
+bool isSignedMultOverflow(value c)
+{
+#if SUBBYTE
+	if (c.val > quantize(S_MINMAX).val )
+#else
+	if (c > quantize(S_MINMAX) )
+#endif
+	{
+		printf("i"); 
+		return true;
+	}
+	return false;
+}
+
+bool isSignedMultUnderflow(value c)
+{
+#if SUBBYTE
+	if (c.val < quantize(-S_MINMAX).val)
+#else
+	if (c < quantize(-S_MINMAX))
+#endif
+	
+	{
+		printf("o"); 
+		return true;
+	}
+	return false;
+}
+
 value quantized_mult(value x, value y)
 {
-	multiplier xterm = (multiplier) (x - zeropoint);
-	multiplier yterm = (multiplier) (y - zeropoint);
-	multiplier scaled = xterm * yterm / invscale;
-	value product = (value) scaled + zeropoint;
-	return product;
+#if SUBBYTE
+	multiplier xterm = (multiplier)x.val - zeropoint.val;
+	//printf("%ld\n", xterm);
+	multiplier yterm = (multiplier)y.val - zeropoint.val;
+	//printf("%ld\n", yterm);
+	multiplier xyproduct = xterm * yterm;
+	multiplier scaled = xyproduct / invscale.val;
+	value product = {scaled + zeropoint.val};
+	//if (product > multmax) multmax = product;
+	//if (product < multmin) multmin = product;
+	
+	
+	if (SATURATE && SIGNED) 
+	{
+		//if (isSignedMultOverflow(product)) return (value) product;//quantize(float_max);
+		if (isSignedMultOverflow(product)) return quantize(S_MINMAX);//
+		//else if (isSignedMultUnderflow(product)) return (value) product;//quantize(-float_max);
+		else if (isSignedMultUnderflow(product)) return quantize(-S_MINMAX);//
+	}
+#else
+	multiplier xterm = (multiplier)x - zeropoint;
+	//printf("%ld\n", xterm);
+	multiplier yterm = (multiplier)y - zeropoint;
+	//printf("%ld\n", yterm);
+	multiplier xyproduct = xterm * yterm;
+	multiplier scaled = xyproduct / invscale;
+	multiplier product = scaled + zeropoint;
+	if (product > multmax) multmax = product;
+	if (product < multmin) multmin = product;
+	
+	if (SATURATE && SIGNED) 
+	{
+		//if (isSignedMultOverflow(product)) return (value) product;//quantize(float_max);
+		if (isSignedMultOverflow(product)) return quantize(S_MINMAX);//
+		//else if (isSignedMultUnderflow(product)) return (value) product;//quantize(-float_max);
+		else if (isSignedMultUnderflow(product)) return quantize(-S_MINMAX);//
+	}
+	return (value) product;
+#endif
+	
 }
+
+value addmax;
+value addmin;
 
 value quantized_add(value x, value y)
 {
 	//multxy = 2*max(xscale,yscale)
 	//multx = 2
-	multiplier xterm = (multiplier) (x - zeropoint);
+#if SUBBYTE
+	multiplier xterm = (multiplier)x.val - zeropoint.val;
 	xterm = (xterm) / 2;
-	multiplier yterm = (multiplier) (y - zeropoint); 
+	multiplier yterm = (multiplier)y.val - zeropoint.val; 
 	yterm = (yterm) / 2;
-	multiplier scaled = (xterm + yterm) * 2;
+	multiplier scaled = (xterm + yterm);
+	scaled = scaled * 2;
+
+	value sum = {(multiplier) scaled + zeropoint.val};
+	// if (sum > addmax) addmax = sum;
+	// if (sum < addmin) addmin = sum;
+#else
+	multiplier xterm = (multiplier)x - zeropoint;
+	xterm = (xterm) / 2;
+	multiplier yterm = (multiplier)y - zeropoint; 
+	yterm = (yterm) / 2;
+	multiplier scaled = (xterm + yterm);
+	scaled = scaled * 2;
+
 	value sum = (value) scaled + zeropoint;
+	if (sum > addmax) addmax = sum;
+	if (sum < addmin) addmin = sum;
+#endif
+	if (SATURATE && SIGNED)
+	{
+		//if (isSignedAddOverflow(x, y, sum)) return (value) sum;
+		if (isSignedAddOverflow(sum)) return quantize(S_MINMAX);
+		//else if (isSignedAddUnderflow(x, y, sum)) return (value) sum;//quantize(-float_max);
+		else if (isSignedAddUnderflow(sum)) return quantize(-S_MINMAX);
+	}
 	return sum;
+#endif
+	
 }
 
-#endif
 
 
 value relu_func(value x) {
+	
+#if QUANTIZE
+	value alpha = quantize(0.2f);
 	value zero = quantize(0.0f);
+	#if SUBBYTE
+		if (x.val > zero.val) return x;
+		else return quantized_mult(alpha,x);
+	#else
+		if (x > zero) return x;
+		else return quantized_mult(alpha,x);
+	#endif
+#else
+	value zero = 0.0f;
+	value alpha = 0.2f;
 	if (x > zero) return x;
-	else return zero;
+	else return alpha*x;
+#endif
 }
 
+
+value leaky_relu_func(value x) {
+#if QUANTIZE
+	value zero = quantize(0.0f);
+	#if SUBBYTE 
+		if (x.val > zero.val) return x;
+	#else
+		if (x > zero) return x;
+	#endif
+#else
+	value zero = 0.0f;
+	if (x > zero) return x;
+#endif
+	else return zero;
+
+}
 
 value hard_sigmoid_func(value x) {
 	value sigmoid;
 #if QUANTIZE
 	value upperlimit = quantize(2.5f);
 	value lowerlimit = quantize(-2.5f);
-	if (x <= lowerlimit) sigmoid = quantize(0.0f);
-	else if (x >= upperlimit) sigmoid = quantize(1.0f);
-	else
-	{
-		value offset = quantize(0.5f);
-		value coeff = quantize(0.2f);
-		sigmoid = quantized_add(offset, quantized_mult(coeff, x));
-	}
+	#if SUBBYTE
+		if (x.val <= lowerlimit.val) sigmoid = quantize(0.0f);
+		else if (x.val >= upperlimit.val) sigmoid = quantize(1.0f);
+		else
+		{
+			value offset = quantize(0.5f);
+			value coeff = quantize(0.2f);
+			sigmoid = quantized_add(offset, quantized_mult(coeff, x));
+		}
+	#else
+		if (x <= lowerlimit) sigmoid = quantize(0.0f);
+		else if (x >= upperlimit) sigmoid = quantize(1.0f);
+		else
+		{
+			value offset = quantize(0.5f);
+			value coeff = quantize(0.2f);
+			sigmoid = quantized_add(offset, quantized_mult(coeff, x));
+		}
+	#endif
 		//if (test < 1) printf("sigmoid %f \n", dequantize(sigmoid));
 #else 
 	if (x <= -2.5f) {
@@ -350,9 +553,12 @@ value hard_sigmoid_func(value x) {
 	return sigmoid;
 }
 
+#if !SUBBYTE
+
 value sigmoid_func(value x) {
     return 1/(1+exp(-x));
 }
+#endif
 
 void dense(tensor* output, const tensor* input, const tensor* kernel,
                const tensor* bias, value fwork[]) {
@@ -362,8 +568,15 @@ void dense(tensor* output, const tensor* input, const tensor* kernel,
     outrows = 1;
     const size_t outcols = kernel->shape[1];
     const size_t innerdim = kernel->shape[0];
-	
+#if QUANTIZE
+	for (size_t i = 0; i < outcols*sizeof(output->array[0]); i++)
+	{
+		output->array[i] = zeropoint;                                                                            
+	}
+	//memset(, zeropoint, outcols*sizeof(output->array[0]));
+#else
 	memset(output->array, 0, outcols*sizeof(output->array[0]));
+#endif
 
 	for (size_t j = 0;  j < outcols; ++j) {//outcols = units
 		for (size_t k = 0; k < innerdim; ++k) {//innerdim = inwidth/units
@@ -409,97 +622,117 @@ void lstmcell(value state[], const value input[], const tensor* kernel,
     value *yf = &fwork[5*units];
     value *yc = &fwork[6*units];
     value *yo = &fwork[7*units];
-
-	
 	
 	//printf("lstm_cell \n ");
 	//printf("units: %zd\n ", units); //100 for lstm1, 50 for lstm2
 	//printf("in_width: %zd\n ", in_width); //25 for lstm1, 100 for lstm2
-	memset(xi, 0, units*8*sizeof(xi[0]));
+	
 #if QUANTIZE
-		for (size_t j = 0;  j < units; ++j) {//outcols = units
-			for (size_t k = 0; k < in_width; ++k) {//innerdim = inwidth
-			//W_i/f/c/o*input (2.5k times) or U_i/f/c/o*x_i_f_c_o (10k times) x4 overall for i f c o
-				if (test < 5) printf("sigmoid %"PRId32" \n", (input[k]));
-				if (test < 5) printf("sigmoidf %f \n", dequantize(input[k]));
-				if (test < 5) printf("sigmoid %"PRId32" \n", ( Wi[k*units+j]));
-				if (test < 5) printf("sigmoidf %f \n", dequantize(Wi[k*units+j]));
-				if (test < 5) printf("sigmoid %"PRId32" \n", (xi[j]));
-				if (test < 5) printf("sigmoidf %f \n", dequantize(xi[j]));
-				if (test < 5) printf("sigmoid %"PRId32" \n", quantized_mult(input[k], Wi[k*units+j]));
-				if (test < 5) printf("sigmoidf %f \n", dequantize(quantized_mult(input[k], Wi[k*units+j])));
-				
-				xi[j] = quantized_add(xi[j], quantized_mult(input[k], Wi[k*units+j]));
-				xf[j] = quantized_add(xf[j], quantized_mult(input[k], Wf[k*units+j]));
-				xc[j] = quantized_add(xc[j], quantized_mult(input[k], Wc[k*units+j]));
-				xo[j] = quantized_add(xo[j], quantized_mult(input[k], Wo[k*units+j]));
-				
-				if (test < 5) printf("sigmoid %"PRId32" \n", (xi[j]));
-				if (test < 5) printf("sigmoidf %f \n\n", dequantize(xi[j]));
-				test +=1;
-			}
-			for (size_t k = 0; k < units; ++k) {//innerdim = units
-				yi[j] = quantized_add(yi[j], quantized_mult(h_prev[k], Ui[k*units+j]));
-				yf[j] = quantized_add(yf[j], quantized_mult(h_prev[k], Uf[k*units+j]));
-				yc[j] = quantized_add(yc[j], quantized_mult(h_prev[k], Uc[k*units+j]));
-				yo[j] = quantized_add(yo[j], quantized_mult(h_prev[k], Uo[k*units+j]));
-			}
+	// memset(xi, zeropoint, units*8*sizeof(xi[0]));
+	
+	for (size_t i = 0; i < units; i++)
+	{
+		xi[i] = xf[i] = xc[i] = xo[i] = yi[i] = yf[i] = yc[i] = yo[i] =  zeropoint;                                                                            
+		 // = zeropoint;
+		 // = zeropoint;
+		 // = zeropoint;
+		 // = zeropoint;                                                                            
+		 // = zeropoint;
+		 // = zeropoint;
+		 // = zeropoint;
+		
+	}
+	for (size_t j = 0;  j < units; ++j) {//outcols = units
+		for (size_t k = 0; k < in_width; ++k) {//innerdim = inwidth
+		//W_i/f/c/o*input (2.5k times) or U_i/f/c/o*x_i_f_c_o (10k times) x4 overall for i f c o
+			if (test < 5) printf("sigmoid %"PRIu32" \n", (input[k]));
+			if (test < 5) printf("sigmoidf %f \n", dequantize(input[k]));
+			if (test < 5) printf("sigmoid %"PRIu32" \n", ( Wi[k*units+j]));
+			if (test < 5) printf("sigmoidf %f \n", dequantize(Wi[k*units+j]));
+			if (test < 5) printf("sigmoid %"PRIu32" \n", (xi[j]));
+			if (test < 5) printf("sigmoidf %f \n", dequantize(xi[j]));
+			if (test < 5) printf("sigmoid %"PRIu32" \n", quantized_mult(input[k], Wi[k*units+j]));
+			if (test < 5) printf("sigmoidf %f \n", dequantize(quantized_mult(input[k], Wi[k*units+j])));
+			value multi = quantized_mult(input[k], Wi[k*units+j]);
+			xi[j] = quantized_add(xi[j], multi);
+			value multf = quantized_mult(input[k], Wf[k*units+j]);
+			xf[j] = quantized_add(xf[j], multf);
+			value multc = quantized_mult(input[k], Wc[k*units+j]);
+			xc[j] = quantized_add(xc[j], multc);
+			value multo = quantized_mult(input[k], Wo[k*units+j]);
+			xo[j] = quantized_add(xo[j], multo);
+			
+			if (test < 5) printf("sigmoid %"PRIu32" \n", (xi[j]));
+			if (test < 5) printf("sigmoidf %f \n\n", dequantize(xi[j]));
+			test +=1;
 		}
-		for (size_t j = 0;  j < units; ++j) {
-			value qo = quantized_add(quantized_add(yo[j], xo[j]), bo[j]);
-			value qf = quantized_add(quantized_add(yf[j], xf[j]), bf[j]);
-			value qi = quantized_add(quantized_add(yi[j], xi[j]), bi[j]);
-			value qc = quantized_add(quantized_add(yc[j], xc[j]), bc[j]);
-			qo = hard_sigmoid_func(qo);
-			yo[j] = qo;
-			qf = hard_sigmoid_func(qf);
-			qi = hard_sigmoid_func(qi);
-			qc = hard_sigmoid_func(qc);
-			yc[j] = quantized_add(quantized_mult(qf, c_prev[j]), quantized_mult(qi, qc));
-			state[units+j] = yc[j];
-			state[j] = quantized_mult(qo,hard_sigmoid_func(yc[j]));
+		for (size_t k = 0; k < units; ++k) {//innerdim = units
+			value multi = quantized_mult(h_prev[k], Ui[k*units+j]);
+			yi[j] = quantized_add(yi[j], multi);
+			value multf = quantized_mult(h_prev[k], Uf[k*units+j]);
+			yf[j] = quantized_add(yf[j], multf);
+			value multc = quantized_mult(h_prev[k], Uc[k*units+j]);
+			yc[j] = quantized_add(yc[j], multc);
+			value multo = quantized_mult(h_prev[k], Uo[k*units+j]);
+			yo[j] = quantized_add(yo[j], multo);
 		}
-		for (size_t i = 0; i < 100 && test < 1; i++)
-		{
-			float weight = (dequantize(state[i]));
-			printf("%zu : %f \n", i, weight);
-		}
-		test += 1;
+	}
+	for (size_t j = 0;  j < units; ++j) {
+		value qo = quantized_add(quantized_add(yo[j], xo[j]), bo[j]);
+		value qf = quantized_add(quantized_add(yf[j], xf[j]), bf[j]);
+		value qi = quantized_add(quantized_add(yi[j], xi[j]), bi[j]);
+		value qc = quantized_add(quantized_add(yc[j], xc[j]), bc[j]);
+		qo = hard_sigmoid_func(qo);
+		yo[j] = qo;
+		qf = hard_sigmoid_func(qf);
+		qi = hard_sigmoid_func(qi);
+		qc = hard_sigmoid_func(qc);
+		yc[j] = quantized_add(quantized_mult(qf, c_prev[j]), quantized_mult(qi, qc));
+		state[units+j] = yc[j];
+		state[j] = quantized_mult(qo,hard_sigmoid_func(yc[j]));
+	}
+	for (size_t i = 0; i < 100 && test < 1; i++)
+	{
+		float weight = (dequantize(state[i]));
+		printf("%zu : %f \n", i, weight);
+	}
+	test += 1;
 #else 
-		for (size_t j = 0;  j < units; ++j) {//outcols = units
-			for (size_t k = 0; k < in_width; ++k) {//innerdim = inwidth
-			//W_i/f/c/o*input (2.5k times) or U_i/f/c/o*x_i_f_c_o (10k times) x4 overall for i f c o
-				if (test < 5) printf("sigmoid %f \n", (input[k]));
-				if (test < 5) printf("sigmoid %f \n", ( Wi[k*units+j]));
-				if (test < 5) printf("sigmoid %f \n", (xi[j]));
-				if (test < 5) printf("sigmoid %f \n", ( input[k] * Wi[k*units+j]));
-				xi[j] += input[k] * Wi[k*units+j]; 
-				xf[j] += input[k] * Wf[k*units+j]; 
-				xc[j] += input[k] * Wc[k*units+j]; 
-				xo[j] += input[k] * Wo[k*units+j]; 
-				
-				if (test < 5) printf("sigmoid %f \n\n", (xi[j]));
-				test +=1;
-			}
-			for (size_t k = 0; k < units; ++k) {//innerdim = units
-				yi[j] += h_prev[k] * Ui[k*units+j]; 
-				yf[j] += h_prev[k] * Uf[k*units+j];
-				yc[j] += h_prev[k] * Uc[k*units+j];
-				yo[j] += h_prev[k] * Uo[k*units+j];
-			}
+	memset(xi, 0, units*8*sizeof(xi[0]));
+	for (size_t j = 0;  j < units; ++j) {//outcols = units
+		for (size_t k = 0; k < in_width; ++k) {//innerdim = inwidth
+		//W_i/f/c/o*input (2.5k times) or U_i/f/c/o*x_i_f_c_o (10k times) x4 overall for i f c o
+			// if (test < 5) printf("sigmoid %f \n", (input[k]));
+			// if (test < 5) printf("sigmoid %f \n", ( Wi[k*units+j]));
+			// if (test < 5) printf("sigmoid %f \n", (xi[j]));
+			// if (test < 5) printf("sigmoid %f \n", ( input[k] * Wi[k*units+j]));
+			xi[j] += input[k] * Wi[k*units+j]; 
+			xf[j] += input[k] * Wf[k*units+j]; 
+			xc[j] += input[k] * Wc[k*units+j]; 
+			xo[j] += input[k] * Wo[k*units+j]; 
+			
+			if (test < 5) printf("sigmoid %f \n\n", (xi[j]));
+			test +=1;
 		}
-		for (size_t j = 0;  j < units; ++j) {
-			yo[j] = hard_sigmoid_func(yo[j] + xo[j]+ bo[j]);
-			yc[j] = hard_sigmoid_func(yf[j] + xf[j]+ bf[j])*c_prev[j] + hard_sigmoid_func(yi[j] + xi[j]+ bi[j])*hard_sigmoid_func(yc[j] + xc[j]+ bc[j]);
-			state[units+j] = yc[j];
-			state[j] = yo[j]*hard_sigmoid_func(yc[j]);
-		}   
-		for (size_t i = 0; i < 100 && test < 1; i++)
-		{
-			float weight = (state[i]);
-			printf("%zu : %f \n", i, weight);
+		for (size_t k = 0; k < units; ++k) {//innerdim = units
+			yi[j] += h_prev[k] * Ui[k*units+j]; 
+			yf[j] += h_prev[k] * Uf[k*units+j];
+			yc[j] += h_prev[k] * Uc[k*units+j];
+			yo[j] += h_prev[k] * Uo[k*units+j];
 		}
-		test += 1;
+	}
+	for (size_t j = 0;  j < units; ++j) {
+		yo[j] = hard_sigmoid_func(yo[j] + xo[j]+ bo[j]);
+		yc[j] = hard_sigmoid_func(yf[j] + xf[j]+ bf[j])*c_prev[j] + hard_sigmoid_func(yi[j] + xi[j]+ bi[j])*hard_sigmoid_func(yc[j] + xc[j]+ bc[j]);
+		state[units+j] = yc[j];
+		state[j] = yo[j]*hard_sigmoid_func(yc[j]);
+	}   
+	for (size_t i = 0; i < 100 && test < 1; i++)
+	{
+		float weight = (state[i]);
+		// printf("%zu : %f \n", i, weight);
+	}
+	test += 1;
 #endif
 }
 
@@ -676,10 +909,18 @@ int main() {
 	invscale = get_invscale();
 	zeropoint = get_zeropoint(invscale);
 	
-	printf("Scale Inverse: %"PRId32"\n", invscale);
-	printf("Zero Point: %"PRId32"\n", zeropoint);
-	printf("Sigmoid Upper Limit: %"PRId32"\n", quantize(2.5f));
-	printf("Sigmoid Lower Limit: %"PRId32"\n", quantize(-2.5f));
+	multmax = multmin = addmax = addmin = zeropoint;
+	
+	printf("Scale Inverse: %"PRIu32"\n", invscale);
+	printf("Zero Point: %"PRIu32"\n", zeropoint);
+	printf("Quantized Zero: %"PRIu32"\n", quantize(0.0f));
+	printf("DeQuantized Zero: %f\n", dequantize(quantize(0.0f)));
+	printf("Quantized Max: %"PRIu32"\n", quantize(float_max-0.000000000001));
+	printf("DeQuantized Max: %f\n", dequantize(quantize(float_max-0.000000000001)));
+	
+	printf("DeQuantized 2-1: %f\n", dequantize(quantized_mult(quantize(2.0f), quantize(-1.0f))));
+	printf("Sigmoid Upper Limit: %"PRIu32"\n", quantize(2.5f));
+	printf("Sigmoid Lower Limit: %"PRIu32"\n", quantize(-2.5f));
 #endif
 	
 	
@@ -713,7 +954,15 @@ int main() {
 	#if QUANTIZE
 		writetofile(&test_input_array[0], "q_seq_array_test_last.txt", MTEST*MHEIGHT*MWIDTH);
 		value q_truth_array[MTEST];
-		for(int i = 0; i < MTEST; ++i) q_truth_array[i] = (value)test_truth_array[i];
+		#if SUBBYTE
+			for(int i = 0; i < MTEST; ++i) 
+			{
+				value temp = {(multiplier) test_truth_array[i]};
+				q_truth_array[i] = temp;
+			}
+		#else 
+			for(int i = 0; i < MTEST; ++i) q_truth_array[i] = (value)test_truth_array[i];
+		#endif
 		writetofile(&q_truth_array[0], "q_label_array_test_last.txt", MTEST);
 	#else
 		writetofile(&test_input_array[0], "ff_seq_array_test_last.txt", MTEST*MHEIGHT*MWIDTH);
@@ -733,6 +982,11 @@ int main() {
 	clock_t t1 = clock();
 	printf("Test time: %e s \n",
            (double)(t1-t0)/(double)CLOCKS_PER_SEC/(double)10);
+		   
+#if QUANTIZE 
+	printf("Add Range: %"PRIu32" - %"PRIu32" : %f - %f \n", addmin, addmax, dequantize(addmin), dequantize(addmax));
+	printf("Mult Range: %"PRIu32" - %"PRIu32" : %f -  %f \n", multmin, multmax, dequantize(multmin), dequantize(multmax));
+#endif
 	for (size_t i =0; i < MTEST; i++) {
 		printf("Test: %zu ", i);
 		float result;
@@ -755,6 +1009,10 @@ int main() {
 	printf("Number of tests failed: %f\n", maxerror);
 	maxerror = maxerror / MTEST;
 	printf("Error rate for 93 tests: %.3f%% \n", maxerror);
+	
+
+	
+	
 }
 
 
