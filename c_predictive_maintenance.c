@@ -7,6 +7,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #define MTEST 93
 #define MHEIGHT 50
@@ -16,7 +17,7 @@
 #define LSTM_1_UNITS 50
 #define LSTM_2_UNITS 100
 
-#define QUANT_BITS 4 //Set to 8,16,32
+#define QUANT_BITS 16 //Set to 8,16,32
 
 #define QUANTIZE 1 //Running quantization
 
@@ -24,13 +25,19 @@
 
 #define CONVERT_INPUT 1 //If you want to convert the input from float to value. Do not enable if you have not enabled QUANTIZE
 #define SAVE_DATA 0 //If you want to save the data
-#define F_RANGE 2.5f
+#define F_RANGE 3.5f
 
 #define S_MINMAX F_RANGE
 
 #define SUBBYTE (QUANT_BITS <= 4)
 
 #define SATURATE 0
+
+double timespec_diff_sec( timespec start, timespec end ) {
+	double t = end.tv_sec - start.tv_sec;
+	t += ((double)(end.tv_nsec - start.tv_nsec)/1000000000L);
+	return t;
+}
 
 float float_range;
 float float_max;
@@ -470,9 +477,9 @@ value quantized_add(value x, value y)
 		else if (isSignedAddUnderflow(sum)) return quantize(-S_MINMAX);
 	}
 	return sum;
-#endif
 	
 }
+#endif
 
 
 
@@ -776,10 +783,10 @@ value lstm_2_recurrent_kernel_array[10000];
 value lstm_2_bias_array[200];
 value dense_1_kernel_array[50];
 value dense_1_bias_array[1] = {
-    -4.99580391e-02,
+    //-4.99580391e-02, // swjun for compiling
 };
 
-void predictive_maintenance(tensor* lstm_1_input, tensor* dense_1_output) {
+void predictive_maintenance(tensor* lstm_1_input, tensor* dense_1_output, double* compute_seconds) {
 	if (!data_loaded) {
 #if CONVERT_INPUT
 		printf("Converting Float Weights...\n");
@@ -882,6 +889,10 @@ void predictive_maintenance(tensor* lstm_1_input, tensor* dense_1_output) {
 	}
 #endif
 	
+	timespec start;
+	timespec now;
+	clock_gettime(CLOCK_REALTIME, & start);
+
     lstm(&lstm_1_output,lstm_1_input,lstm_1_state,&lstm_1_kernel,
              &lstm_1_recurrent_kernel,&lstm_1_bias,lstm_1_fwork,
              lstm_1_return_sequences);
@@ -890,6 +901,9 @@ void predictive_maintenance(tensor* lstm_1_input, tensor* dense_1_output) {
              lstm_2_return_sequences);
     dense(dense_1_output,&lstm_2_output,&dense_1_kernel,
               &dense_1_bias,dense_1_fwork);
+
+	clock_gettime(CLOCK_REALTIME, & now);
+	*compute_seconds += timespec_diff_sec(start,now);
 
 }
 
@@ -969,15 +983,22 @@ int main() {
 		writetofile(&test_truth_array[0], "ff_label_array_test_last.txt", MTEST);
 	#endif
 #endif
+
+	float thresh = 0.5;
+	int num_positives = 0;
+	int num_predicted_positives = 0;
+	int num_mispredicted_positives = 0;
+	int num_mispredicted_negatives = 0;
 	
 	float errors[MTEST];
 	size_t num_tests = 93;
 	size_t num_outputs = 1;
 	
+	double compute_seconds = 0;
 	clock_t t0 = clock();
 	for (size_t i=0; i < MTEST; i++) {
 		printf("Running Test No. %zu...\n", i);
-		predictive_maintenance(&test_input[i],&test_output[i]);
+		predictive_maintenance(&test_input[i],&test_output[i], &compute_seconds);
 	}
 	clock_t t1 = clock();
 	printf("Test time: %e s \n",
@@ -997,20 +1018,36 @@ int main() {
 #else
 		result = test_output[i].array[0];
 #endif
+		if ( result < thresh ) {
+			result = 0;
+			if ( test_truth_array[i] > 0.5 ) num_mispredicted_negatives ++;
+		}
+		else {
+			result = 1;
+			num_predicted_positives ++;
+			if ( test_truth_array[i] <= 0.5 ) num_mispredicted_positives++;
+		}
+		if ( test_truth_array[i] > 0.5 ) num_positives++;
 		printf("Result: %f ", result);
 		printf("Truth: %f ", test_truth_array[i]); 
 		errors[i] = round(fabs(round(result) - round(test_truth_array[i])));
 		printf("Error: %f \n", errors[i]);
 	}
-	float maxerror = errors[0];
-    for(size_t i=1; i< MTEST; i++) {
+	float maxerror = 0;
+	/*
+    for(size_t i=0; i< MTEST; i++) {
         maxerror += errors[i];
 	}
+	*/
+	maxerror = num_mispredicted_negatives + num_mispredicted_positives;
 	printf("Number of tests failed: %f\n", maxerror);
 	maxerror = maxerror / MTEST;
 	printf("Error rate for 93 tests: %.3f%% \n", maxerror);
+
+	printf( "mis_neg: %d mis_pos: %d pred_pos: %d / total_pos: %d -- total: %d\n", num_mispredicted_negatives, num_mispredicted_positives, num_predicted_positives, num_positives, MTEST);
 	
 
+	printf( "Compute time: %lf\n", compute_seconds);
 	
 	
 }
